@@ -1,15 +1,15 @@
 ﻿using ChatociCupidSNUS.Models;
 using Microsoft.AspNetCore.SignalR;
+using System.Collections.Concurrent;
 using System.Security.Cryptography;
 
 namespace ChatociCupidSNUS
 {
+
     public class CupidonMessageHub : Hub
     {
-        private static readonly Dictionary<string, Person> _subs = new();
-        private static readonly Dictionary<string, string> _connections = new();
-        private static readonly Dictionary<string, HashSet<string>> _blocked = new();
-        private static readonly Dictionary<string, bool> _hasPending = new();
+        private static readonly ConcurrentDictionary<string, UserSession> _sessions = new();
+        private static readonly ConcurrentDictionary<string, string> _connectionToUserMap = new();
 
         private static readonly string[] _cupidMessages = {
             "Excited to see you",
@@ -19,57 +19,61 @@ namespace ChatociCupidSNUS
 
         public async Task InitSinglePerson(Person person)
         {
-            if (_subs.ContainsKey(person.Username))
+            var session = new UserSession
             {
-                await Clients.Caller.SendAsync("Error", $"Username '{person.Username}' already exists.");
-                Console.WriteLine($"[SERVER] username {person.Username} already exists!");
+                Profile = person,
+                ConnectionId = Context.ConnectionId,
+                HasPending = false
+            };
+
+            if (!_sessions.TryAdd(person.Username, session))
+            {
+                await Clients.Caller.SendAsync("Error", $"Username '{person.Username}' already exists");
+                Console.WriteLine($"[SERVER] username {person.Username} already exist");
                 return;
             }
 
-            _subs[person.Username] = person;
-            _connections[person.Username] = Context.ConnectionId;
-            _blocked[person.Username] = new HashSet<string>();
-            _hasPending[person.Username] = false;
+            _connectionToUserMap[Context.ConnectionId] = person.Username;
 
             Console.WriteLine($"[SERVER] '{person.Username}' registered");
-            await Clients.Caller.SendAsync("Registered", $"Successfully registered");
+            await Clients.Caller.SendAsync("Registered", "Successfully registered");
         }
 
         public async Task TriggerCupidRound()
         {
-            Console.WriteLine($"[SERVER] Started sending messagse");
+            Console.WriteLine("[SERVER] Started sending messages");
 
-            var people = _subs.Values.ToList();
-            if (people.Count < 2)
+            var activeSessions = _sessions.Values.ToList();
+            if (activeSessions.Count < 2)
             {
                 Console.WriteLine("[SERVER] Need more pepol");
                 return;
             }
 
-            foreach (var sender in people)
+            foreach (var senderSession in activeSessions)
             {
-                var match = FindBestMatch(sender, people);
-                if (match == null) continue;
+                var matchSession = FindBestMatch(senderSession, activeSessions);
+                if (matchSession == null) continue;
 
-                if (_hasPending.TryGetValue(match.Username, out bool pending) && pending)
+                if (matchSession.HasPending)
                 {
-                    Console.WriteLine($"[SERVER] '{match.Username}' has unread letter");
+                    Console.WriteLine($"[SERVER] '{matchSession.Profile.Username}' has unread letter");
                     continue;
                 }
 
-                if (_blocked.TryGetValue(match.Username, out var blockedSet)
-                    && blockedSet.Contains(sender.Username))
+                if (matchSession.BlockedUsers.ContainsKey(senderSession.Profile.Username))
                 {
-                    Console.WriteLine($"[SERVER] '{match.Username}' blocked '{sender.Username}'");
+                    Console.WriteLine($"[SERVER] '{matchSession.Profile.Username}' blocked '{senderSession.Profile.Username}'");
                     continue;
                 }
 
-                if (_blocked.TryGetValue(sender.Username, out var blockedSetSender)
-                    && blockedSetSender.Contains(match.Username))
+                if (senderSession.BlockedUsers.ContainsKey(matchSession.Profile.Username))
                 {
-                    Console.WriteLine($"[SERVER] '{sender.Username}' blocked '{match.Username}'");
+                    Console.WriteLine($"[SERVER] '{senderSession.Profile.Username}' blocked '{matchSession.Profile.Username}'");
                     continue;
                 }
+
+                matchSession.HasPending = true;
 
                 int msgIndex = CryptoRandInt(0, _cupidMessages.Length);
                 string message = _cupidMessages[msgIndex];
@@ -77,59 +81,59 @@ namespace ChatociCupidSNUS
 
                 var letter = new Letter
                 {
-                    FromUsername = sender.Username,
-                    FromCity = sender.City,
-                    FromAge = sender.Age,
-                    FromPhone = disinterested ? "hidden" : sender.PhoneNumber,
+                    FromUsername = senderSession.Profile.Username,
+                    FromCity = senderSession.Profile.City,
+                    FromAge = senderSession.Profile.Age,
+                    FromPhone = disinterested ? "hidden" : senderSession.Profile.PhoneNumber,
                     Message = message
                 };
 
-                if (_connections.TryGetValue(match.Username, out var connId))
-                {
-                    _hasPending[match.Username] = true;
-                    await Clients.Client(connId).SendAsync("LetterArrived", letter);
-                    Console.WriteLine($"[SERVER] Letter: '{sender.Username}' to '{match.Username}' | \"{message}\"");
-                }
+                await Clients.Client(matchSession.ConnectionId).SendAsync("LetterArrived", letter);
+                Console.WriteLine($"[SERVER] Letter: '{senderSession.Profile.Username}' to '{matchSession.Profile.Username}' | \"{message}\"");
             }
         }
 
         public Task ConfirmRead(string username)
         {
-            if (_hasPending.ContainsKey(username))
-                _hasPending[username] = false;
-
-            Console.WriteLine($"[SERVER] '{username}' confirmed letter");
+            if (_sessions.TryGetValue(username, out var session))
+            {
+                session.HasPending = false;
+                Console.WriteLine($"[SERVER] '{username}' confirmed letter");
+            }
             return Task.CompletedTask;
         }
 
         public async Task BlockUser(string requester, string target)
         {
-            if (!_subs.ContainsKey(target))
+            if (!_sessions.ContainsKey(target))
             {
                 await Clients.Caller.SendAsync("Error", $"User '{target}' doesnt exist.");
                 return;
             }
 
-            _blocked[requester].Add(target);
-            await Clients.Caller.SendAsync("Blocked", $"'{target}' was blokced.");
-            Console.WriteLine($"[SERVER] '{requester}' blocked '{target}'.");
+            if (_sessions.TryGetValue(requester, out var session))
+            {
+                session.BlockedUsers.TryAdd(target, 0);
+                await Clients.Caller.SendAsync("Blocked", $"'{target}' was blocked");
+                Console.WriteLine($"[SERVER] '{requester}' blocked '{target}'.");
+            }
         }
 
-        private static Person? FindBestMatch(Person sender, List<Person> all)
+        private static UserSession? FindBestMatch(UserSession sender, List<UserSession> all)
         {
-            Person? best = null;
+            UserSession? best = null;
             int bestScore = -1;
 
             foreach (var candidate in all)
             {
-                if (candidate.Username == sender.Username) continue;
+                if (candidate.Profile.Username == sender.Profile.Username) continue;
 
                 int score = 0;
 
-                if (string.Equals(candidate.City, sender.City, StringComparison.OrdinalIgnoreCase))
+                if (string.Equals(candidate.Profile.City, sender.Profile.City, StringComparison.OrdinalIgnoreCase))
                     score += 30;
 
-                if (Math.Abs(candidate.Age - sender.Age) <= 2)
+                if (Math.Abs(candidate.Profile.Age - sender.Profile.Age) <= 2)
                     score += 20;
 
                 score += CryptoRandInt(0, 101);
@@ -146,25 +150,29 @@ namespace ChatociCupidSNUS
 
         private static int CryptoRandInt(int minInclusive, int maxExclusive)
         {
-            using var rng = new RNGCryptoServiceProvider();
-            var bytes = new byte[4];
-            rng.GetBytes(bytes);
-            uint value = BitConverter.ToUInt32(bytes, 0);
-            return minInclusive + (int)(value % (uint)(maxExclusive - minInclusive));
+            return RandomNumberGenerator.GetInt32(minInclusive, maxExclusive);
         }
 
         public override Task OnDisconnectedAsync(Exception? exception)
         {
-            var entry = _connections.FirstOrDefault(kv => kv.Value == Context.ConnectionId);
-            if (entry.Key != null)
+            if (_connectionToUserMap.TryRemove(Context.ConnectionId, out var username))
             {
-                _subs.Remove(entry.Key);
-                _connections.Remove(entry.Key);
-                _blocked.Remove(entry.Key);
-                _hasPending.Remove(entry.Key);
-                Console.WriteLine($"[SERVER] '{entry.Key}' disconnected.");
+                _sessions.TryRemove(username, out _);
+                Console.WriteLine($"[SERVER] '{username}' disconnected.");
             }
             return base.OnDisconnectedAsync(exception);
+        }
+
+        private static int CryptoRandIntObs(int minInclusive, int maxExclusive)
+        {
+            using var rng = new RNGCryptoServiceProvider();
+
+            var bytes = new byte[4];
+            rng.GetBytes(bytes);
+            uint value = BitConverter.ToUInt32(bytes, 0);
+            uint range = (uint)(maxExclusive - minInclusive);
+
+            return minInclusive + (int)(value % range);
         }
     }
 }

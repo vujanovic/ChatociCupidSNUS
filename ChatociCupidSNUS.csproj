@@ -1,10 +1,21 @@
-<Project Sdk="Microsoft.NET.Sdk.Web">
+﻿<Project Sdk="Microsoft.NET.Sdk.Web">
 
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="Pub\**" />
+    <Compile Remove="UserSub\**" />
+    <Content Remove="Pub\**" />
+    <Content Remove="UserSub\**" />
+    <EmbeddedResource Remove="Pub\**" />
+    <EmbeddedResource Remove="UserSub\**" />
+    <None Remove="Pub\**" />
+    <None Remove="UserSub\**" />
+  </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="Swashbuckle.AspNetCore" Version="6.6.2" />
